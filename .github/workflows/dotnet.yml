@@ -1,0 +1,82 @@
+# This workflow builds and tests the .NET PE Loader project
+name: .NET CI
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build-and-test:
+
+    # We MUST run on Windows to use Windows APIs and build/load PE files
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Add MSVC (C/C++ compiler) to PATH
+      # This action sets up cl.exe and link.exe
+      uses: microsoft/setup-msvc@v1
+
+    - name: Restore .NET dependencies
+      run: dotnet restore
+    
+    - name: Build C# Loader (x64)
+      # We build for a specific runtime (win-x64) to match our C++ build
+      # Assumes your project is named Marina.csproj
+      run: dotnet build Marina.csproj --no-restore --configuration Release --runtime win-x64
+
+    - name: Build C Test App (x64)
+      # We compile our new CI-friendly C file
+      # Assumes minimal_ci.c is in the root.
+      run: |
+        Set-Content -Path "minimal_ci.c" -Value @"
+        #include <windows.h>
+        const char msg[] = "MAGIC_STRING_SUCCESS: Hello from the reflectively loaded PE!\n";
+        #define MSG_LEN (sizeof(msg) - 1) 
+        void MyEntryPoint()
+        {
+            DWORD bytesWritten;
+            HANDLE hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+            WriteFile(hStdOut, msg, MSG_LEN, &bytesWritten, NULL);
+            ExitThread(0); 
+        }
+        "@
+        cl.exe /c /GS- /nologo minimal_ci.c
+        link.exe /SUBSYSTEM:CONSOLE /NODEFAULTLIB /ENTRY:MyEntryPoint /OUT:minimal_ci.exe minimal_ci.obj kernel32.lib
+      shell: powershell
+      
+    - name: Run Integration Test
+      # We run the C# loader and pass the C .exe as an argument
+      # The new Program.cs will accept minimal_ci.exe as args[0]
+      run: |
+        .\bin\Release\net8.0\win-x64\Marina.exe minimal_ci.exe > output.txt 2>&1
+      shell: powershell
+
+    - name: Validate Test Output
+      # This is the test! We check if our "magic string" was printed.
+      # If it's not found, the workflow will fail.
+      run: |
+        $content = Get-Content ./output.txt
+        $magicString = "MAGIC_STRING_SUCCESS"
+        
+        Write-Host "--- Test Output ---"
+        Write-Host $content
+        Write-Host "-------------------"
+
+        if ($content -match $magicString) {
+          Write-Host "Success: Magic string found in output."
+          exit 0
+        } else {
+          Write-Host "Failure: Magic string NOT found in output."
+          exit 1
+        }
+      shell: powershell
+
