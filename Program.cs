@@ -7,18 +7,20 @@ namespace Marina
     {
         static void Main(string[] args)
         {
+            Console.WriteLine("Marina: An In Memory PE Loader Demo");
+            Console.Write("Enter path to PE file (DLL or EXE): ");
             PEBinary pe = new PEBinary(Console.ReadLine());
 
             try
             {
                 Console.WriteLine($"[+] Parsed. Arch: {(pe.Is64Bit ? "x64" : "x86")}, Type: {(pe.IsDll ? "DLL" : "EXE")}");
 
-                // 2. Load the image into executable memory
+                // Load the image into executable memory
                 // This runs BuildImageBuffer, VirtualAlloc, ApplyRelocations, and EmulateIATWrite
                 var nativeBase = pe.LoadImage(PEBinary.DefaultWin32Resolver);
                 Console.WriteLine($"[+] Image loaded at: 0x{nativeBase.ToInt64():X}");
 
-                // 3. "Jump" to the entry point
+                //"Jump" to the entry point
                 // This runs TLS callbacks and then calls the entry point
                 IntPtr hThread = pe.ExecuteLoadedImage(nativeBase, false); // false = don't wait
 
