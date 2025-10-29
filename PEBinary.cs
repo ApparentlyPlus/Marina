@@ -7,17 +7,19 @@ using System.Text;
 
 public class PEBinary
 {
+    // Publicly visible parsed blobs, keep these stable for callers.
     public byte[] Data { get; private set; }
     public IMAGE_DOS_HEADER DosHeader { get; private set; }
     public IMAGE_FILE_HEADER FileHeader { get; private set; }
 
-    // Exactly one will be set
+    // Exactly one of these will be populated.
     public IMAGE_OPTIONAL_HEADER32? OptionalHeader32 { get; private set; }
     public IMAGE_OPTIONAL_HEADER64? OptionalHeader64 { get; private set; }
 
+    // Section table (disk headers)
     public List<IMAGE_SECTION_HEADER> SectionHeaders { get; private set; } = new List<IMAGE_SECTION_HEADER>();
 
-    // Parsed tables
+    // Parsed directories / tables
     public List<ImportDescriptor> Imports { get; private set; } = new List<ImportDescriptor>();
     public List<ExportEntry> Exports { get; private set; } = new List<ExportEntry>();
     public List<BaseRelocBlock> BaseRelocations { get; private set; } = new List<BaseRelocBlock>();
@@ -25,10 +27,10 @@ public class PEBinary
     public TLSDirectory TLS { get; private set; } = null;
     public ResourceDirectory Resources { get; private set; } = null;
 
-    // Built (mapped) image
+    // Built, mapped image (headers + sections, after we 'map' it in memory)
     public byte[] Image { get; private set; } = null;
 
-    // Public summary props
+    // Convenience summary properties
     public bool Is64Bit => OptionalHeader64.HasValue;
     public ulong ImageBase => OptionalHeader64?.ImageBase ?? OptionalHeader32?.ImageBase ?? 0UL;
     public uint SizeOfImage => OptionalHeader64?.SizeOfImage ?? OptionalHeader32?.SizeOfImage ?? 0U;
@@ -38,7 +40,7 @@ public class PEBinary
     public bool IsDll => (FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
 
 
-
+    // ctor: read file and attempt parse
     public PEBinary(string filePath)
     {
         if (!File.Exists(filePath))
@@ -50,6 +52,8 @@ public class PEBinary
         }
         catch
         {
+            // File.ReadAllBytes throws an exception for extremely large files on some runtimes;
+            // user-friendly rewrap so callers get a clearer message.
             throw new Exception("The file exceeds the maximum size allowed by File.ReadAllBytes(). Please choose a smaller file.");
         }
 
@@ -58,58 +62,60 @@ public class PEBinary
 
     private void TryParse()
     {
-        // DOS
+        // ----- DOS header -----
         DosHeader = Helpers.FromBytes<IMAGE_DOS_HEADER>(Data, 0);
         if (DosHeader.e_magic != 0x5A4D) // 'MZ'
             throw new Exception("Not a valid PE file (missing MZ header).");
 
-        // NT
-        int ntOffset = DosHeader.e_lfanew;
-        if (ntOffset <= 0 || ntOffset + 4 > Data.Length) throw new Exception("Invalid e_lfanew.");
-        uint ntSig = BitConverter.ToUInt32(Data, ntOffset);
-        if (ntSig != 0x00004550) // 'PE\0\0'
+        // ----- NT header signature -----
+        int ntHdrOffset = DosHeader.e_lfanew;
+        if (ntHdrOffset <= 0 || ntHdrOffset + 4 > Data.Length) throw new Exception("Invalid e_lfanew.");
+        uint ntSignature = BitConverter.ToUInt32(Data, ntHdrOffset);
+        if (ntSignature != 0x00004550) // 'PE\0\0'
             throw new Exception("Invalid NT Header signature.");
 
-        // File header
-        int fileHdrOff = ntOffset + 4;
-        FileHeader = Helpers.FromBytes<IMAGE_FILE_HEADER>(Data, fileHdrOff);
+        // ----- File header -----
+        int fileHdrOffset = ntHdrOffset + 4;
+        FileHeader = Helpers.FromBytes<IMAGE_FILE_HEADER>(Data, fileHdrOffset);
 
-        // Optional header
-        int optOff = fileHdrOff + Marshal.SizeOf(typeof(IMAGE_FILE_HEADER));
-        ushort magic = BitConverter.ToUInt16(Data, optOff);
-        if (magic == 0x10b)
+        // ----- Optional header -----
+        int optHdrOffset = fileHdrOffset + Marshal.SizeOf(typeof(IMAGE_FILE_HEADER));
+        ushort optMagic = BitConverter.ToUInt16(Data, optHdrOffset);
+        if (optMagic == 0x10b)
         {
-            OptionalHeader32 = Helpers.FromBytes<IMAGE_OPTIONAL_HEADER32>(Data, optOff);
+            OptionalHeader32 = Helpers.FromBytes<IMAGE_OPTIONAL_HEADER32>(Data, optHdrOffset);
         }
-        else if (magic == 0x20b)
+        else if (optMagic == 0x20b)
         {
-            OptionalHeader64 = Helpers.FromBytes<IMAGE_OPTIONAL_HEADER64>(Data, optOff);
+            OptionalHeader64 = Helpers.FromBytes<IMAGE_OPTIONAL_HEADER64>(Data, optHdrOffset);
         }
         else
         {
             throw new Exception("Unknown Optional Header Magic.");
         }
 
-        // Sections
-        int optSize = FileHeader.SizeOfOptionalHeader;
-        int sectOff = optOff + optSize;
-        int sectSize = Marshal.SizeOf(typeof(IMAGE_SECTION_HEADER));
+        // ----- Section headers -----
+        int optionalHdrSize = FileHeader.SizeOfOptionalHeader;
+        int secTableOffset = optHdrOffset + optionalHdrSize;
+        int secEntrySize = Marshal.SizeOf(typeof(IMAGE_SECTION_HEADER));
         SectionHeaders.Clear();
+
+        // Human note: do not assume the file is perfectly formed; be defensive.
         for (int i = 0; i < FileHeader.NumberOfSections; i++)
         {
-            int off = sectOff + i * sectSize;
-            if (off + sectSize > Data.Length) break;
-            var sh = Helpers.FromBytes<IMAGE_SECTION_HEADER>(Data, off);
-            SectionHeaders.Add(sh);
+            int entryOffset = secTableOffset + i * secEntrySize;
+            if (entryOffset + secEntrySize > Data.Length) break;
+            var section = Helpers.FromBytes<IMAGE_SECTION_HEADER>(Data, entryOffset);
+            SectionHeaders.Add(section);
         }
 
-        // Tables
+        // parse data directories (exports, imports, relocs, resources)
         ParseDataDirectoriesAndTables();
     }
 
-    // ---------------------------
-    // Data directory indices
-    // ---------------------------
+
+    #region Data directory indices
+
     private const int DD_EXPORT = 0;
     private const int DD_IMPORT = 1;
     private const int DD_RESOURCE = 2;
@@ -126,6 +132,7 @@ public class PEBinary
     private const int DD_DELAY_IMPORT = 13;
     private const int DD_COM_DESCRIPTOR = 14;
 
+    // Grab data directory array in a neutral way
     private IMAGE_DATA_DIRECTORY[] GetDirectories()
     {
         if (OptionalHeader32.HasValue) return OptionalHeader32.Value.DataDirectory;
@@ -160,73 +167,78 @@ public class PEBinary
             ParseResources(dirs[DD_RESOURCE].VirtualAddress, dirs[DD_RESOURCE].Size);
     }
 
-    // ---------------------------
-    // RVA helpers
-    // ---------------------------
+    #endregion
+
+
+    #region RVA helpers
 
     /// <summary>
-    /// Converts a Relative Virtual Address (RVA) to a file offset in the Data[].
-    /// Returns -1 if the RVA is invalid, points outside the file, or points
-    /// to uninitialized data (which has no file offset).
+    /// Convert RVA -> file offset in Data[].
+    /// Returns -1 for invalid/unmapped RVA (e.g., .bss).
+    /// This function errs on the side of safety rather than optimism.
     /// </summary>
     public int RvaToOffset(uint rva)
     {
-        uint soHeaders = GetSizeOfHeaders();
-        if (rva < soHeaders)
+        uint hdrSize = GetSizeOfHeaders();
+
+        // If the RVA is within headers, it's a direct mapping (if file contains that many bytes).
+        if (rva < hdrSize)
         {
-            // RVA is in the headers.
-            // Check if it's within the bounds of the loaded file data.
+            // Defensive: ensure we don't return an offset beyond the file.
             if (rva >= Data.Length) return -1;
             return (int)rva;
         }
 
+        // Otherwise, find the section that contains this RVA.
         foreach (var s in SectionHeaders)
         {
-            uint va = s.VirtualAddress;
-            uint vsz = s.VirtualSize; // The size in memory
-            uint rsz = s.SizeOfRawData; // The size on disk
+            uint secVa = s.VirtualAddress;
+            uint secVirtualSize = s.VirtualSize;   // size in memory
+            uint secRawSize = s.SizeOfRawData;     // size on disk
 
-            // Check if the RVA is within this section's memory range
-            if (rva >= va && rva < va + vsz)
+            // If the RVA is within the memory area of the section
+            if (rva >= secVa && rva < secVa + secVirtualSize)
             {
-                uint delta = rva - va;
+                uint offsetInSection = rva - secVa;
 
-                // If the offset within the section is greater than its raw size,
-                // it points to uninitialized data (e.g., .bss). This has no
-                // file offset.
-                if (delta >= rsz)
+                // If offset falls into uninitialized (virtual-only) tail, there is no file data.
+                if (offsetInSection >= secRawSize)
                 {
                     return -1;
                 }
 
-                int fileOffset = (int)(s.PointerToRawData + delta);
+                int fileOff = (int)(s.PointerToRawData + offsetInSection);
 
-                // Final sanity check: does the calculated offset point within the file?
-                // (rsz check should be sufficient, but this protects against
-                // sections that point to raw data > file length)
-                if (fileOffset < 0 || fileOffset + (rsz - delta) > Data.Length)
+                // Sanity check: ensure we don't point past the file end.
+                if (fileOff < 0 || fileOff + (secRawSize - offsetInSection) > Data.Length)
                 {
                     return -1;
                 }
 
-                return fileOffset;
+                return fileOff;
             }
         }
+
+        // Not found in any section; invalid RVA.
         return -1;
     }
 
+    // Return the section header that would contain this RVA (or null).
     private IMAGE_SECTION_HEADER? GetSectionForRva(uint rva)
     {
-        foreach (var s in SectionHeaders)
+        foreach (var sec in SectionHeaders)
         {
-            uint va = s.VirtualAddress;
-            uint vsz = Math.Max(s.VirtualSize, s.SizeOfRawData);
-            if (rva >= va && rva < va + vsz)
-                return s;
+            uint va = sec.VirtualAddress;
+            // Use max of VirtualSize and SizeOfRawData to be tolerant of odd files.
+            uint span = Math.Max(sec.VirtualSize, sec.SizeOfRawData);
+            if (rva >= va && rva < va + span)
+                return sec;
         }
         return null;
     }
 
+    // Read a null-terminated ASCII string from file using an RVA.
+    // Returns null on error.
     private string ReadAsciiStringAtRva(uint rva)
     {
         int off = RvaToOffset(rva);
@@ -241,50 +253,60 @@ public class PEBinary
         return sb.ToString();
     }
 
-    // ---------------------------
-    // BUILD IMAGE (headers + sections)
-    // ---------------------------
+    #endregion
+
+    #region BUILD IMAGE (headers + sections)
+
     public byte[] BuildImageBuffer()
     {
         uint imageSize = SizeOfImage;
         if (imageSize == 0) throw new Exception("SizeOfImage is zero; cannot build image.");
 
-        var img = new byte[imageSize];
+        var mapped = new byte[imageSize];
 
-        // Copy headers (bounded)
-        uint sizeOfHeaders = GetSizeOfHeaders();
-        int headersCopySize = (int)Math.Min(sizeOfHeaders == 0 ? (uint)Data.Length : sizeOfHeaders, (uint)Data.Length);
-        Array.Copy(Data, 0, img, 0, headersCopySize);
+        // Copy the headers (but don't exceed the file's length).
+        uint hdrSize = GetSizeOfHeaders();
+        int copyLen = (int)Math.Min(hdrSize == 0 ? (uint)Data.Length : hdrSize, (uint)Data.Length);
+        Array.Copy(Data, 0, mapped, 0, copyLen);
 
-        // Copy sections raw data to their VirtualAddress
-        foreach (var s in SectionHeaders)
+        // Copy sections into their virtual addresses inside the image buffer.
+        foreach (var sec in SectionHeaders)
         {
-            if (s.SizeOfRawData == 0) continue;
-            int srcOff = (int)s.PointerToRawData;
-            if (srcOff < 0 || srcOff >= Data.Length) continue;
+            if (sec.SizeOfRawData == 0) continue;
 
-            int destOff = (int)s.VirtualAddress;
-            uint copySize = Math.Min(s.SizeOfRawData, s.VirtualSize);
-            if (srcOff + copySize > Data.Length) copySize = (uint)Math.Max(0, Data.Length - srcOff);
-            if (destOff + copySize > img.Length) copySize = (uint)Math.Max(0, img.Length - destOff);
-            if (copySize > 0)
-                Array.Copy(Data, srcOff, img, destOff, (int)copySize);
+            int srcOffset = (int)sec.PointerToRawData;
+            if (srcOffset < 0 || srcOffset >= Data.Length) continue;
 
-            // Zero the remainder up to VirtualSize if VirtualSize > SizeOfRawData
-            if (s.VirtualSize > s.SizeOfRawData)
+            int dstOffset = (int)sec.VirtualAddress;
+            // We copy up to the lesser of raw size and virtual size.
+            uint bytesToCopy = Math.Min(sec.SizeOfRawData, sec.VirtualSize);
+
+            // Guard: don't read past the file.
+            if (srcOffset + bytesToCopy > Data.Length)
+                bytesToCopy = (uint)Math.Max(0, Data.Length - srcOffset);
+
+            // Guard: don't write past the image buffer either.
+            if (dstOffset + bytesToCopy > mapped.Length)
+                bytesToCopy = (uint)Math.Max(0, mapped.Length - dstOffset);
+
+            if (bytesToCopy > 0)
+                Array.Copy(Data, srcOffset, mapped, dstOffset, (int)bytesToCopy);
+
+            // If virtual size is larger than raw size, zero the remainder (BSS-like).
+            if (sec.VirtualSize > sec.SizeOfRawData)
             {
-                int padStart = destOff + (int)s.SizeOfRawData;
-                int padLen = (int)Math.Min((ulong)(s.VirtualSize - s.SizeOfRawData), (ulong)(img.Length - padStart));
-                if (padStart >= 0 && padLen > 0 && padStart + padLen <= img.Length)
-                    Array.Clear(img, padStart, padLen);
+                int padStart = dstOffset + (int)sec.SizeOfRawData;
+                int padLen = (int)Math.Min((ulong)(sec.VirtualSize - sec.SizeOfRawData), (ulong)(mapped.Length - padStart));
+                if (padStart >= 0 && padLen > 0 && padStart + padLen <= mapped.Length)
+                    Array.Clear(mapped, padStart, padLen);
             }
         }
 
-        Image = img; // store
-        return img;
+        Image = mapped; // keep a reference for further patching
+        return mapped;
     }
 
-    // Convenience: convert RVA (relative to mapped image) to index in Image[]
+    // Convert an RVA relative to the mapped image produced by BuildImageBuffer() into an index.
     private int RvaToImageIndex(uint rva)
     {
         if (Image == null) throw new InvalidOperationException("Call BuildImageBuffer() first.");
@@ -293,100 +315,103 @@ public class PEBinary
     }
 
     /// <summary>
-    /// A cache for the DefaultWin32Resolver to avoid multiple LoadLibrary calls.
+    /// A tiny resolver cache used by the DefaultWin32Resolver so we don't call LoadLibrary repeatedly.
+    /// Not thread-safe intentionally — this is for tooling, not a high-concurrency server.
     /// </summary>
     private static Dictionary<string, IntPtr> _resolverModuleCache = new Dictionary<string, IntPtr>(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// A default ImportResolver that uses LoadLibrary/GetProcAddress to find function pointers.
+    /// Default resolver: LoadLibraryA + GetProcAddress.
+    /// Returns 0 when resolution fails.
     /// </summary>
     public static ulong DefaultWin32Resolver(string dllName, string functionName, ushort? ordinal)
     {
-        if (!_resolverModuleCache.TryGetValue(dllName, out IntPtr hModule))
+        if (!_resolverModuleCache.TryGetValue(dllName, out IntPtr hMod))
         {
-            hModule = Native.LoadLibraryA(dllName);
-            if (hModule == IntPtr.Zero)
+            hMod = Native.LoadLibraryA(dllName);
+            if (hMod == IntPtr.Zero)
             {
-                // Console.WriteLine($"[Resolver] Failed to load {dllName}");
+                // intentional silence: callers may expect missing imports in some analysis scenarios.
                 return 0;
             }
-            _resolverModuleCache[dllName] = hModule;
+            _resolverModuleCache[dllName] = hMod;
         }
 
-        IntPtr pFunc = IntPtr.Zero;
+        IntPtr pFn = IntPtr.Zero;
         if (functionName != null)
         {
-            pFunc = Native.GetProcAddress(hModule, functionName);
+            pFn = Native.GetProcAddress(hMod, functionName);
         }
         else if (ordinal.HasValue)
         {
-            // Ordinals must be passed as an IntPtr (HIWORD=0, LOWORD=ordinal)
-            pFunc = Native.GetProcAddress(hModule, (IntPtr)ordinal.Value);
+            // GetProcAddress accepts ordinals as IntPtr on Win32.
+            pFn = Native.GetProcAddress(hMod, (IntPtr)ordinal.Value);
         }
 
-        // if (pFunc == IntPtr.Zero) Console.WriteLine($"[Resolver] Failed to find {functionName ?? ordinal.ToString()} in {dllName}");
-
-        return (ulong)pFunc;
+        return (ulong)pFn;
     }
 
     /// <summary>
-    /// Clears the static module cache used by the DefaultWin32Resolver.
+    /// Free everything in the static resolver cache. Best-effort.
     /// </summary>
     public static void ClearResolverCache()
     {
-        foreach (var kvp in _resolverModuleCache)
+        foreach (var kv in _resolverModuleCache)
         {
-            Native.FreeLibrary(kvp.Value);
+            Native.FreeLibrary(kv.Value);
         }
         _resolverModuleCache.Clear();
     }
 
-    // ---------------------------
-    // EXECUTION & LOADING
-    // ---------------------------
+    #endregion
+
+
+    #region EXECUTION & LOADING
 
     /// <summary>
-    /// Simulates the Windows Loader:
-    /// 1. Allocates executable memory.
-    /// 2. Builds the image buffer (headers + sections).
-    /// 3. Applies base relocations to the new address.
-    /// 4. Resolves and writes the IAT.
-    /// 5. Copies the final image into executable memory.
-    /// Returns the native base address of the loaded image.
+    /// Simulated loader:
+    /// 1) Build a mapped image (managed).
+    /// 2) Allocate RWX native memory.
+    /// 3) Apply relocations for the chosen native base.
+    /// 4) Resolve imports and write into the IAT(s).
+    /// 5) Copy image to native memory and return its base address.
+    /// 
+    /// This intentionally mirrors Windows loader steps roughly; don't expect perfect parity.
     /// </summary>
     public IntPtr LoadImage(ImportResolver resolver)
     {
         if (resolver == null) throw new ArgumentNullException(nameof(resolver));
 
-        // 1. Build the image in a managed byte[] first
-        BuildImageBuffer(); // Populates this.Image
+        // Step 1: build a mapped image buffer we can patch.
+        BuildImageBuffer(); // side-effect: sets this.Image
         if (this.Image == null) throw new InvalidOperationException("BuildImageBuffer() failed.");
 
-        // 2. Allocate native executable memory
+        // Step 2: allocate native executable memory (RWX for simplicity).
         IntPtr nativeBase = Native.VirtualAlloc(
-            IntPtr.Zero, // OS chooses address
+            IntPtr.Zero,
             (UIntPtr)this.Image.Length,
             Native.MEM_COMMIT | Native.MEM_RESERVE,
             Native.PAGE_EXECUTE_READ_WRITE
         );
+
         if (nativeBase == IntPtr.Zero)
             throw new Exception("Failed to allocate executable memory.");
 
-        // 3. Apply relocations based on the new native address
+        // Step 3: apply relocations to the in-memory image (Image[]), using the newly chosen base.
         ApplyRelocations((ulong)nativeBase);
 
-        // 4. Resolve imports and write them into the IAT
+        // Step 4: resolve imports (both regular and delay-load) and write addresses into IAT.
         EmulateIATWrite(resolver);
 
-        // 5. Copy the final, patched image into the executable memory
+        // Step 5: copy patched image into native memory.
         Marshal.Copy(this.Image, 0, nativeBase, this.Image.Length);
 
         return nativeBase;
     }
 
     /// <summary>
-    /// Executes the TLS callbacks (if any) for a loaded image.
-    /// This MUST be called before the entry point.
+    /// Execute TLS callbacks (if any). Must be invoked before the module's entry point.
+    /// This mirrors what the real loader does: callbacks are invoked in the loader's context.
     /// </summary>
     private void ExecuteTLSCallbacks(IntPtr nativeBase)
     {
@@ -397,55 +422,50 @@ public class PEBinary
         {
             if (rva == 0) continue;
             IntPtr pCallback = IntPtr.Add(nativeBase, (int)rva);
-            var callback = Marshal.GetDelegateForFunctionPointer<Native.DllMain>(pCallback);
+            var cb = Marshal.GetDelegateForFunctionPointer<Native.DllMain>(pCallback);
 
-            // Call the callback with DLL_PROCESS_ATTACH
-            callback(nativeBase, Native.DLL_PROCESS_ATTACH, IntPtr.Zero);
+            // DLL_PROCESS_ATTACH semantics.
+            cb(nativeBase, Native.DLL_PROCESS_ATTACH, IntPtr.Zero);
         }
     }
 
     /// <summary>
-    // Executes a loaded image at its native base address.
-    // - Calls TLS Callbacks.
-    // - If a DLL, calls DllMain(ATTACH) in the current thread.
-    // - If an EXE, calls the EntryPoint in a new thread.
+    /// Execute an already-loaded image.
+    /// - TLS callbacks are invoked.
+    /// - For DLLs: DllMain(ATTACH) is called inline on current thread.
+    /// - For EXEs: entry point is launched in a new thread (optionally waited upon).
+    /// Returns thread handle for EXE threads; IntPtr.Zero for DLLs or on failure.
     /// </summary>
-    /// <param name="nativeBase">The pointer returned by LoadImage().</param>
-    /// <param name="waitForThread">If true, blocks until the new EXE thread exits.</param>
-    /// <returns>The thread handle if an EXE is launched, otherwise IntPtr.Zero.</returns>
     public IntPtr ExecuteLoadedImage(IntPtr nativeBase, bool waitForThread = false)
     {
         if (nativeBase == IntPtr.Zero)
             throw new ArgumentException("nativeBase cannot be zero.");
 
-        // 1. Execute TLS Callbacks
+        // 1. TLS callbacks
         ExecuteTLSCallbacks(nativeBase);
 
-        // 2. Get the final entry point address
-        uint aoe = AddressOfEntryPoint;
-        if (aoe == 0)
-            return IntPtr.Zero; // No entry point
+        // 2. Entry point RVA
+        uint entryRva = AddressOfEntryPoint;
+        if (entryRva == 0)
+            return IntPtr.Zero;
 
-        IntPtr pEntryPoint = IntPtr.Add(nativeBase, (int)aoe);
+        IntPtr pEntry = IntPtr.Add(nativeBase, (int)entryRva);
 
         if (IsDll)
         {
-            // --- This is a DLL ---
-            // Call DllMain(ATTACH) directly in this thread
-            // This mimics LoadLibrary's behavior
-            var dllMain = Marshal.GetDelegateForFunctionPointer<Native.DllMain>(pEntryPoint);
+            // Call DllMain(ATTACH) in the current thread.
+            var dllMain = Marshal.GetDelegateForFunctionPointer<Native.DllMain>(pEntry);
             dllMain(nativeBase, Native.DLL_PROCESS_ATTACH, IntPtr.Zero);
-            return IntPtr.Zero; // No thread handle
+            return IntPtr.Zero;
         }
         else
         {
-            // --- This is an EXE ---
-            // Launch the entry point in a new thread
+            // Launch EXE entry point in a new thread (signature matches CreateThread style).
             IntPtr hThread = Native.CreateThread(
                 IntPtr.Zero, 0,
-                pEntryPoint,
-                IntPtr.Zero, // No parameter
-                0, // Run immediately
+                pEntry,
+                IntPtr.Zero, // no lpParameter
+                0,           // run immediately
                 out uint _
             );
 
@@ -456,73 +476,79 @@ public class PEBinary
                 return IntPtr.Zero;
             }
 
-            return hThread; // Return the new thread's handle
+            return hThread;
         }
     }
 
     /// <summary>
-    /// Cleans up a loaded image:
-    /// 1. Calls DllMain(DETACH) if it's a DLL.
-    /// 2. Frees the executable memory via VirtualFree.
+    /// Unload an image previously allocated via LoadImage.
+    /// Calls DllMain(DETACH) if appropriate and then frees memory.
+    /// This is best-effort; swallow exceptions during DllMain to avoid leaving process in a bad state.
     /// </summary>
     public void UnloadImage(IntPtr nativeBase)
     {
         if (nativeBase == IntPtr.Zero) return;
 
-        // If it's a DLL, we must call DllMain(DETACH)
         if (IsDll && AddressOfEntryPoint != 0)
         {
             try
             {
-                IntPtr pEntryPoint = IntPtr.Add(nativeBase, (int)AddressOfEntryPoint);
-                var dllMain = Marshal.GetDelegateForFunctionPointer<Native.DllMain>(pEntryPoint);
+                IntPtr pEntry = IntPtr.Add(nativeBase, (int)AddressOfEntryPoint);
+                var dllMain = Marshal.GetDelegateForFunctionPointer<Native.DllMain>(pEntry);
                 dllMain(nativeBase, Native.DLL_PROCESS_DETACH, IntPtr.Zero);
             }
-            catch { /* Best-effort cleanup */ }
+            catch
+            {
+                // Best-effort cleanup; swallow and proceed to free memory.
+            }
         }
 
-        // Free the memory
         Native.VirtualFree(nativeBase, UIntPtr.Zero, Native.MEM_RELEASE);
     }
 
-    // ---------------------------
-    // IMPORTS
-    // ---------------------------
+    #endregion
+
+    #region IMPORTS
+
     private void ParseImportTable(uint importTableRva, uint importTableSize)
     {
         Imports.Clear();
         int descSize = Marshal.SizeOf(typeof(IMAGE_IMPORT_DESCRIPTOR));
-        int offset = RvaToOffset(importTableRva);
-        if (offset < 0) return;
+        int tableOffset = RvaToOffset(importTableRva);
+        if (tableOffset < 0) return;
 
-        int cursor = offset;
-        while (cursor + descSize <= Data.Length)
+        int cur = tableOffset;
+
+        while (cur + descSize <= Data.Length)
         {
-            IMAGE_IMPORT_DESCRIPTOR desc = Helpers.FromBytes<IMAGE_IMPORT_DESCRIPTOR>(Data, cursor);
-            // zero descriptor = end
+            IMAGE_IMPORT_DESCRIPTOR desc = Helpers.FromBytes<IMAGE_IMPORT_DESCRIPTOR>(Data, cur);
+
+            // All-zero descriptor => end of table.
             if (desc.OriginalFirstThunk == 0 && desc.Name == 0 && desc.FirstThunk == 0 &&
                 desc.TimeDateStamp == 0 && desc.ForwarderChain == 0)
                 break;
 
-            var id = new ImportDescriptor();
-            id.DLLName = ReadAsciiStringAtRva(desc.Name) ?? string.Empty;
+            var importDesc = new ImportDescriptor();
+            importDesc.DLLName = ReadAsciiStringAtRva(desc.Name) ?? string.Empty;
 
-            uint oft = desc.OriginalFirstThunk != 0 ? desc.OriginalFirstThunk : desc.FirstThunk;
-            int thunkOff = RvaToOffset(oft);
-            if (thunkOff >= 0)
+            // Some files omit OriginalFirstThunk; use FirstThunk as fallback.
+            uint sourceThunkRva = desc.OriginalFirstThunk != 0 ? desc.OriginalFirstThunk : desc.FirstThunk;
+            int thunkOffset = RvaToOffset(sourceThunkRva);
+
+            if (thunkOffset >= 0)
             {
                 if (Is64Bit)
                 {
-                    int tcur = thunkOff;
-                    while (tcur + 8 <= Data.Length)
+                    int pos = thunkOffset;
+                    while (pos + 8 <= Data.Length)
                     {
-                        ulong entry = BitConverter.ToUInt64(Data, tcur);
+                        ulong entry = BitConverter.ToUInt64(Data, pos);
                         if (entry == 0) break;
 
                         var ie = new ImportEntry
                         {
-                            IATRVA = desc.FirstThunk + (uint)(tcur - thunkOff),
-                            OriginalThunkRVA = oft + (uint)(tcur - thunkOff)
+                            IATRVA = desc.FirstThunk + (uint)(pos - thunkOffset),
+                            OriginalThunkRVA = sourceThunkRva + (uint)(pos - thunkOffset)
                         };
 
                         const ulong ORD64 = 0x8000000000000000UL;
@@ -539,22 +565,23 @@ public class PEBinary
                             if (nameOff >= 0) ie.Name = ReadAsciiStringAtOffset(nameOff);
                             ie.ByOrdinal = false;
                         }
-                        id.Entries.Add(ie);
-                        tcur += 8;
+
+                        importDesc.Entries.Add(ie);
+                        pos += 8;
                     }
                 }
                 else
                 {
-                    int tcur = thunkOff;
-                    while (tcur + 4 <= Data.Length)
+                    int pos = thunkOffset;
+                    while (pos + 4 <= Data.Length)
                     {
-                        uint entry = BitConverter.ToUInt32(Data, tcur);
+                        uint entry = BitConverter.ToUInt32(Data, pos);
                         if (entry == 0) break;
 
                         var ie = new ImportEntry
                         {
-                            IATRVA = desc.FirstThunk + (uint)(tcur - thunkOff),
-                            OriginalThunkRVA = oft + (uint)(tcur - thunkOff)
+                            IATRVA = desc.FirstThunk + (uint)(pos - thunkOffset),
+                            OriginalThunkRVA = sourceThunkRva + (uint)(pos - thunkOffset)
                         };
 
                         const uint ORD32 = 0x80000000U;
@@ -571,17 +598,19 @@ public class PEBinary
                             if (nameOff >= 0) ie.Name = ReadAsciiStringAtOffset(nameOff);
                             ie.ByOrdinal = false;
                         }
-                        id.Entries.Add(ie);
-                        tcur += 4;
+
+                        importDesc.Entries.Add(ie);
+                        pos += 4;
                     }
                 }
             }
 
-            Imports.Add(id);
-            cursor += descSize;
+            Imports.Add(importDesc);
+            cur += descSize;
         }
     }
 
+    // Helper: read an ASCII string given a direct file offset (not RVA).
     private string ReadAsciiStringAtOffset(int off)
     {
         if (off < 0 || off >= Data.Length) return null;
@@ -595,20 +624,23 @@ public class PEBinary
         return sb.ToString();
     }
 
-    // ---------------------------
-    // DELAY-LOAD IMPORTS
-    // ---------------------------
+    #endregion
+
+    #region D-LOAD IMPORTS
+    
     private void ParseDelayImports(uint rva, uint size)
     {
         DelayImports.Clear();
-        int off = RvaToOffset(rva);
-        if (off < 0) return;
+        int baseOffset = RvaToOffset(rva);
+        if (baseOffset < 0) return;
         int descSize = Marshal.SizeOf(typeof(IMAGE_DELAYLOAD_DESCRIPTOR));
 
-        int cur = off;
+        int cur = baseOffset;
         while (cur + descSize <= Data.Length)
         {
             var d = Helpers.FromBytes<IMAGE_DELAYLOAD_DESCRIPTOR>(Data, cur);
+
+            // A table of zeros indicates termination.
             if (d.AllAttributes == 0 && d.DllNameRVA == 0 && d.ModuleHandleRVA == 0 &&
                 d.ImportAddressTableRVA == 0 && d.DelayImportNameTableRVA == 0)
                 break;
@@ -619,25 +651,24 @@ public class PEBinary
                 DllName = ReadAsciiStringAtRva(d.DllNameRVA) ?? string.Empty
             };
 
-            // Parse its INT/IAT like normal imports
-            uint oft = d.DelayImportNameTableRVA;
-            if (oft != 0)
+            uint nameTblRva = d.DelayImportNameTableRVA;
+            if (nameTblRva != 0)
             {
-                int thunkOff = RvaToOffset(oft);
-                if (thunkOff >= 0)
+                int thunkOffset = RvaToOffset(nameTblRva);
+                if (thunkOffset >= 0)
                 {
                     if (Is64Bit)
                     {
-                        int tcur = thunkOff;
-                        while (tcur + 8 <= Data.Length)
+                        int pos = thunkOffset;
+                        while (pos + 8 <= Data.Length)
                         {
-                            ulong entry = BitConverter.ToUInt64(Data, tcur);
+                            ulong entry = BitConverter.ToUInt64(Data, pos);
                             if (entry == 0) break;
 
                             var ie = new ImportEntry
                             {
-                                IATRVA = d.ImportAddressTableRVA + (uint)(tcur - thunkOff),
-                                OriginalThunkRVA = oft + (uint)(tcur - thunkOff)
+                                IATRVA = d.ImportAddressTableRVA + (uint)(pos - thunkOffset),
+                                OriginalThunkRVA = nameTblRva + (uint)(pos - thunkOffset)
                             };
 
                             const ulong ORD64 = 0x8000000000000000UL;
@@ -653,22 +684,23 @@ public class PEBinary
                                 if (nameOff >= 0) ie.Name = ReadAsciiStringAtOffset(nameOff);
                                 ie.ByOrdinal = false;
                             }
+
                             dd.Entries.Add(ie);
-                            tcur += 8;
+                            pos += 8;
                         }
                     }
                     else
                     {
-                        int tcur = thunkOff;
-                        while (tcur + 4 <= Data.Length)
+                        int pos = thunkOffset;
+                        while (pos + 4 <= Data.Length)
                         {
-                            uint entry = BitConverter.ToUInt32(Data, tcur);
+                            uint entry = BitConverter.ToUInt32(Data, pos);
                             if (entry == 0) break;
 
                             var ie = new ImportEntry
                             {
-                                IATRVA = d.ImportAddressTableRVA + (uint)(tcur - thunkOff),
-                                OriginalThunkRVA = oft + (uint)(tcur - thunkOff)
+                                IATRVA = d.ImportAddressTableRVA + (uint)(pos - thunkOffset),
+                                OriginalThunkRVA = nameTblRva + (uint)(pos - thunkOffset)
                             };
 
                             const uint ORD32 = 0x80000000U;
@@ -684,8 +716,9 @@ public class PEBinary
                                 if (nameOff >= 0) ie.Name = ReadAsciiStringAtOffset(nameOff);
                                 ie.ByOrdinal = false;
                             }
+
                             dd.Entries.Add(ie);
-                            tcur += 4;
+                            pos += 4;
                         }
                     }
                 }
@@ -696,23 +729,24 @@ public class PEBinary
         }
     }
 
-    // ---------------------------
-    // EXPORTS
-    // ---------------------------
+    #endregion
+
+    #region Exports
+
     private void ParseExportTable(uint exportTableRva, uint exportTableSize)
     {
         Exports.Clear();
-        int off = RvaToOffset(exportTableRva);
-        if (off < 0) return;
-        if (off + Marshal.SizeOf(typeof(IMAGE_EXPORT_DIRECTORY)) > Data.Length) return;
+        int dirFileOffset = RvaToOffset(exportTableRva);
+        if (dirFileOffset < 0) return;
+        if (dirFileOffset + Marshal.SizeOf(typeof(IMAGE_EXPORT_DIRECTORY)) > Data.Length) return;
 
-        IMAGE_EXPORT_DIRECTORY ed = Helpers.FromBytes<IMAGE_EXPORT_DIRECTORY>(Data, off);
+        IMAGE_EXPORT_DIRECTORY ed = Helpers.FromBytes<IMAGE_EXPORT_DIRECTORY>(Data, dirFileOffset);
 
         int funcsOff = RvaToOffset(ed.AddressOfFunctions);
         int namesOff = RvaToOffset(ed.AddressOfNames);
-        int ordOff = RvaToOffset(ed.AddressOfNameOrdinals);
+        int ordsOff = RvaToOffset(ed.AddressOfNameOrdinals);
 
-        if (funcsOff < 0) return;
+        if (funcsOff < 0 || namesOff < 0 || ordsOff < 0) return;
 
         for (uint i = 0; i < ed.NumberOfNames; i++)
         {
@@ -721,7 +755,7 @@ public class PEBinary
             if (nameOff < 0) continue;
             string name = ReadAsciiStringAtRva(nameRva);
 
-            ushort ordinalIndex = BitConverter.ToUInt16(Data, ordOff + (int)(i * 2));
+            ushort ordinalIndex = BitConverter.ToUInt16(Data, ordsOff + (int)(i * 2));
             uint funcRva = BitConverter.ToUInt32(Data, funcsOff + (int)(ordinalIndex * 4));
 
             Exports.Add(new ExportEntry
@@ -733,29 +767,30 @@ public class PEBinary
         }
     }
 
-    // ---------------------------
-    // BASE RELOCATIONS
-    // ---------------------------
+    #endregion
+
+    #region Base Reloc
+
     private void ParseBaseRelocations(uint baseRelocRva, uint baseRelocSize)
     {
         BaseRelocations.Clear();
         int curOff = RvaToOffset(baseRelocRva);
         if (curOff < 0) return;
-        int end = curOff + (int)baseRelocSize;
+        int endOff = curOff + (int)baseRelocSize;
 
-        while (curOff + Marshal.SizeOf(typeof(IMAGE_BASE_RELOCATION)) <= Data.Length && curOff < end)
+        while (curOff + Marshal.SizeOf(typeof(IMAGE_BASE_RELOCATION)) <= Data.Length && curOff < endOff)
         {
             IMAGE_BASE_RELOCATION hdr = Helpers.FromBytes<IMAGE_BASE_RELOCATION>(Data, curOff);
             if (hdr.SizeOfBlock == 0) break;
 
             var block = new BaseRelocBlock { VirtualAddress = hdr.VirtualAddress, SizeOfBlock = hdr.SizeOfBlock };
-            int entriesOffset = curOff + Marshal.SizeOf(typeof(IMAGE_BASE_RELOCATION));
+            int entriesStart = curOff + Marshal.SizeOf(typeof(IMAGE_BASE_RELOCATION));
             int entriesCount = ((int)hdr.SizeOfBlock - Marshal.SizeOf(typeof(IMAGE_BASE_RELOCATION))) / 2;
 
             for (int i = 0; i < entriesCount; i++)
             {
-                if (entriesOffset + i * 2 + 2 > Data.Length) break;
-                ushort entry = BitConverter.ToUInt16(Data, entriesOffset + i * 2);
+                if (entriesStart + i * 2 + 2 > Data.Length) break;
+                ushort entry = BitConverter.ToUInt16(Data, entriesStart + i * 2);
                 block.TypeOffsetList.Add(entry);
             }
 
@@ -765,82 +800,85 @@ public class PEBinary
     }
 
     /// <summary>
-    /// Apply relocations into Image[] if newBase != ImageBase. Call BuildImageBuffer() first.
+    /// Apply relocations into Image[] if newBase != ImageBase.
+    /// You must call BuildImageBuffer() first.
     /// </summary>
     public void ApplyRelocations(ulong newBase)
     {
         if (Image == null) throw new InvalidOperationException("Call BuildImageBuffer() first.");
-        if (newBase == ImageBase) return; // nothing to do
+        if (newBase == ImageBase) return; // nothing to patch
+
         long delta = unchecked((long)(newBase - ImageBase));
 
         foreach (var block in BaseRelocations)
         {
             uint pageRva = block.VirtualAddress;
-            foreach (ushort e in block.TypeOffsetList)
+            foreach (ushort entry in block.TypeOffsetList)
             {
-                int type = (e >> 12) & 0xF;
-                int off = e & 0x0FFF;
-                uint fixRva = pageRva + (uint)off;
-                int idx = RvaToImageIndex(fixRva);
-                if (idx < 0) continue;
+                int type = (entry >> 12) & 0xF;
+                int offset = entry & 0x0FFF;
+                uint fixRva = pageRva + (uint)offset;
+                int imgIdx = RvaToImageIndex(fixRva);
+                if (imgIdx < 0) continue;
 
                 switch (type)
                 {
-                    case 0: // ABSOLUTE - skipped (padding)
+                    case 0: // ABSOLUTE: padding, skip.
                         break;
 
-                    case 3: // HIGHLOW (32-bit)
-                        if (idx + 4 <= Image.Length)
+                    case 3: // HIGHLOW (32-bit patch)
+                        if (imgIdx + 4 <= Image.Length)
                         {
-                            int orig = BitConverter.ToInt32(Image, idx);
+                            int orig = BitConverter.ToInt32(Image, imgIdx);
                             int patched = unchecked(orig + (int)delta);
-                            WriteInt32(Image, idx, patched);
+                            WriteInt32(Image, imgIdx, patched);
                         }
                         break;
 
                     case 10: // DIR64 (64-bit)
-                        if (idx + 8 <= Image.Length)
+                        if (imgIdx + 8 <= Image.Length)
                         {
-                            long orig = BitConverter.ToInt64(Image, idx);
+                            long orig = BitConverter.ToInt64(Image, imgIdx);
                             long patched = unchecked(orig + delta);
-                            WriteInt64(Image, idx, patched);
+                            WriteInt64(Image, imgIdx, patched);
                         }
                         break;
 
-                    case 1: // HIGH (add high 16 of delta) – uncommon in modern images
-                        if (idx + 2 <= Image.Length)
+                    case 1: // HIGH (rare): add high 16 bits of delta
+                        if (imgIdx + 2 <= Image.Length)
                         {
-                            short orig = BitConverter.ToInt16(Image, idx);
+                            short orig = BitConverter.ToInt16(Image, imgIdx);
                             short patched = (short)(orig + ((delta >> 16) & 0xFFFF));
-                            WriteInt16(Image, idx, patched);
+                            WriteInt16(Image, imgIdx, patched);
                         }
                         break;
 
-                    case 2: // LOW (add low 16 of delta)
-                        if (idx + 2 <= Image.Length)
+                    case 2: // LOW (rare): add low 16 bits
+                        if (imgIdx + 2 <= Image.Length)
                         {
-                            short orig = BitConverter.ToInt16(Image, idx);
+                            short orig = BitConverter.ToInt16(Image, imgIdx);
                             short patched = (short)(orig + (delta & 0xFFFF));
-                            WriteInt16(Image, idx, patched);
+                            WriteInt16(Image, imgIdx, patched);
                         }
                         break;
 
                     default:
-                        // Other relocation types not handled here (e.g., HIGHADJ); rarely used in typical PE32+/PE32 userland binaries.
+                        // Ignore exotic relocation types for now. Most userland binaries won't need them.
                         break;
                 }
             }
         }
     }
 
-    // ---------------------------
-    // IAT EMULATION
-    // ---------------------------
+    #endregion
+
+    #region IAT Emu
+
     public delegate ulong ImportResolver(string dllName, string functionNameOrNull, ushort? ordinalOrNull);
 
     /// <summary>
-    /// Writes function pointers into IAT locations inside Image using a resolver you provide.
-    /// Handles both normal and delay-load imports.
+    /// Resolve imports via the provided resolver and write pointers into the image IAT.
+    /// Handles both regular imports and delay-load tables.
     /// </summary>
     public void EmulateIATWrite(ImportResolver resolver)
     {
@@ -848,28 +886,28 @@ public class PEBinary
         if (resolver == null) throw new ArgumentNullException(nameof(resolver));
 
         // Regular imports
-        foreach (var d in Imports)
+        foreach (var imp in Imports)
         {
-            foreach (var e in d.Entries)
+            foreach (var ent in imp.Entries)
             {
-                ulong addr = e.ByOrdinal
-                    ? resolver(d.DLLName, null, e.Ordinal)
-                    : resolver(d.DLLName, e.Name, null);
+                ulong resolved = ent.ByOrdinal
+                    ? resolver(imp.DLLName, null, ent.Ordinal)
+                    : resolver(imp.DLLName, ent.Name, null);
 
-                WritePointerToImage(e.IATRVA, addr);
+                WritePointerToImage(ent.IATRVA, resolved);
             }
         }
 
         // Delay-load imports
-        foreach (var d in DelayImports)
+        foreach (var dp in DelayImports)
         {
-            foreach (var e in d.Entries)
+            foreach (var ent in dp.Entries)
             {
-                ulong addr = e.ByOrdinal
-                    ? resolver(d.DllName, null, e.Ordinal)
-                    : resolver(d.DllName, e.Name, null);
+                ulong resolved = ent.ByOrdinal
+                    ? resolver(dp.DllName, null, ent.Ordinal)
+                    : resolver(dp.DllName, ent.Name, null);
 
-                WritePointerToImage(e.IATRVA, addr);
+                WritePointerToImage(ent.IATRVA, resolved);
             }
         }
     }
@@ -889,9 +927,10 @@ public class PEBinary
         }
     }
 
-    // ---------------------------
-    // TLS
-    // ---------------------------
+    #endregion
+
+    #region TLS
+
     private void ParseTLS(uint rva, uint size)
     {
         int off = RvaToOffset(rva);
@@ -931,13 +970,14 @@ public class PEBinary
 
     private List<uint> ReadTLSCallbacks(ulong addressOfCallbacksVA)
     {
-        // addressOfCallbacks is a VA in loaded image (ImageBase + rva), but in the file it's an RVA
-        // In many files, this field is a VA; we convert to RVA by subtracting ImageBase (fits in uint).
+        // The field in the TLS directory may contain either VA or RVA.
+        // If VA, convert to RVA by subtracting ImageBase; otherwise treat as RVA directly.
         if (addressOfCallbacksVA == 0) return new List<uint>();
-        ulong callbacksVA = addressOfCallbacksVA;
-        if (callbacksVA >= ImageBase) // if it's a VA
+
+        ulong callbacksVa = addressOfCallbacksVA;
+        if (callbacksVa >= ImageBase)
         {
-            ulong rva64 = callbacksVA - ImageBase;
+            ulong rva64 = callbacksVa - ImageBase;
             if (rva64 > uint.MaxValue) return new List<uint>();
             uint callbacksRva = (uint)rva64;
             int off = RvaToOffset(callbacksRva);
@@ -945,8 +985,8 @@ public class PEBinary
         }
         else
         {
-            // Sometimes producers store RVA here (non-standard); attempt direct mapping
-            uint callbacksRva = (uint)callbacksVA;
+            // Some builders store RVA here; try that.
+            uint callbacksRva = (uint)callbacksVa;
             int off = RvaToOffset(callbacksRva);
             return ReadTLSCallbacksAtOffset(off);
         }
@@ -985,14 +1025,17 @@ public class PEBinary
         return list;
     }
 
-    // ---------------------------
-    // RESOURCES (recursive)
-    // ---------------------------
+    #endregion
+
+    #region Resources
+
     private void ParseResources(uint rva, uint size)
     {
         int baseOff = RvaToOffset(rva);
         if (baseOff < 0) return;
 
+        // the resource directory functions work in the "resource RVA space", which is
+        // self-relative: child offsets are relative to the directory's RVA.
         Resources = ParseResourceDirectory(rva, baseOff, 0);
     }
 
@@ -1024,7 +1067,8 @@ public class PEBinary
             bool nameIsString = (e.Name & 0x80000000) != 0;
             if (nameIsString)
             {
-                uint nameRva = (e.Name & 0x7FFFFFFF) + (dirRva); // resource dir space is self-relative
+                // name is stored as RVA relative to the resource directory tree base (dirRva)
+                uint nameRva = (e.Name & 0x7FFFFFFF) + (dirRva);
                 re.Name = ReadUnicodeResourceString(nameRva);
             }
             else
@@ -1045,12 +1089,12 @@ public class PEBinary
             {
                 if (childOff >= 0)
                 {
-                    var data = Helpers.FromBytes<IMAGE_RESOURCE_DATA_ENTRY>(Data, childOff);
+                    var dataEntry = Helpers.FromBytes<IMAGE_RESOURCE_DATA_ENTRY>(Data, childOff);
                     re.DataEntry = new ResourceDataEntry
                     {
-                        DataRVA = data.OffsetToData,
-                        Size = data.Size,
-                        CodePage = data.CodePage
+                        DataRVA = dataEntry.OffsetToData,
+                        Size = dataEntry.Size,
+                        CodePage = dataEntry.CodePage
                     };
                 }
             }
@@ -1072,8 +1116,9 @@ public class PEBinary
     }
 
     /// <summary>
-    /// Convenience: fetch raw bytes of a resource given a path (e.g., typeId, nameId/string, langId).
-    /// Pass null to skip a level by index. Returns null if not found.
+    /// Convenience: fetch raw bytes for a resource at a path like (type, name, lang).
+    /// Passing null for a key is treated as "skip level by index" (not implemented).
+    /// Returns null if not found.
     /// </summary>
     public byte[] GetResourceData(object typeKey, object nameKey, object langKey)
     {
@@ -1109,9 +1154,10 @@ public class PEBinary
         return null;
     }
 
-    // ---------------------------
-    // WRITE HELPERS
-    // ---------------------------
+    #endregion
+
+    #region Write Helpers
+
     private static void WriteInt16(byte[] buf, int idx, short v)
     {
         var b = BitConverter.GetBytes(v);
@@ -1138,9 +1184,9 @@ public class PEBinary
         Buffer.BlockCopy(b, 0, buf, idx, 8);
     }
 
-    // ---------------------------
-    // MODELS / STRUCTS
-    // ---------------------------
+    #endregion
+
+    #region Models
 
     [StructLayout(LayoutKind.Sequential)]
     public struct IMAGE_DOS_HEADER
@@ -1449,4 +1495,6 @@ public class PEBinary
         public uint Size { get; set; }
         public uint CodePage { get; set; }
     }
+
+    #endregion
 }
