@@ -292,6 +292,56 @@ public class PEBinary
         return (int)rva;
     }
 
+    /// <summary>
+    /// A cache for the DefaultWin32Resolver to avoid multiple LoadLibrary calls.
+    /// </summary>
+    private static Dictionary<string, IntPtr> _resolverModuleCache = new Dictionary<string, IntPtr>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// A default ImportResolver that uses LoadLibrary/GetProcAddress to find function pointers.
+    /// </summary>
+    public static ulong DefaultWin32Resolver(string dllName, string functionName, ushort? ordinal)
+    {
+        if (!_resolverModuleCache.TryGetValue(dllName, out IntPtr hModule))
+        {
+            hModule = Native.LoadLibraryA(dllName);
+            if (hModule == IntPtr.Zero)
+            {
+                // Console.WriteLine($"[Resolver] Failed to load {dllName}");
+                return 0;
+            }
+            _resolverModuleCache[dllName] = hModule;
+        }
+
+        IntPtr pFunc = IntPtr.Zero;
+        if (functionName != null)
+        {
+            pFunc = Native.GetProcAddress(hModule, functionName);
+        }
+        else if (ordinal.HasValue)
+        {
+            // Ordinals must be passed as an IntPtr (HIWORD=0, LOWORD=ordinal)
+            pFunc = Native.GetProcAddress(hModule, (IntPtr)ordinal.Value);
+        }
+
+        // if (pFunc == IntPtr.Zero) Console.WriteLine($"[Resolver] Failed to find {functionName ?? ordinal.ToString()} in {dllName}");
+
+        return (ulong)pFunc;
+    }
+
+    /// <summary>
+    /// Clears the static module cache used by the DefaultWin32Resolver.
+    /// </summary>
+    public static void ClearResolverCache()
+    {
+        foreach (var kvp in _resolverModuleCache)
+        {
+            Native.FreeLibrary(kvp.Value);
+        }
+        _resolverModuleCache.Clear();
+    }
+
+
     // ---------------------------
     // IMPORTS
     // ---------------------------
