@@ -9,7 +9,7 @@ using System.Threading.Tasks;
 /// <summary>
 /// Defines native Win32 functions and constants for process memory manipulation.
 /// </summary>
-static class Native
+public static class Native
 {
     // Memory
     public const uint MEM_COMMIT = 0x1000;
