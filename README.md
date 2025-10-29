@@ -1,5 +1,7 @@
 # Marina: A C\# Reflective Windows PE Loader
 
+[![Marina CI](https://github.com/ApparentlyPlus/Marina/actions/workflows/dotnet.yml/badge.svg)](https://github.com/ApparentlyPlus/Marina/actions/workflows/dotnet.yml)
+
 `Marina` is an educational C\# project that demonstrates the principles of **Reflective PE Loading**. It is split into C\# files, each implementing a part of the `PEBinary` class that parses a Windows Portable Executable (PE) file (an `.exe` or `.dll`) from disk, manually mimics the actions of the Windows OS loader, and executes the file *within its own process memory*.
 
 This is **not** a wrapper for `Process.Start()`. It performs the complex, low-level operations required to "revive" a PE file from its disk state into a runnable, in-memory image. This project is intended for educational and security research purposes ONLY. 
@@ -17,7 +19,7 @@ This is **not** a wrapper for `Process.Start()`. It performs the complex, low-le
 > **Use this tool for learning and analysis on files you have compiled yourself.**
 
 > [!CAUTION]
-> Don’t get any funny ideas, I kept it barebones on purpose. That way, script-kiddies can’t just waltz in and load whatever fancy PE they find on the internet.
+> Don t get any funny ideas, I kept it barebones on purpose. That way, script-kiddies can t just waltz in and load whatever fancy PE they find on the internet.
 
 ## Key Features
 
