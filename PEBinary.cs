@@ -244,7 +244,7 @@ public class PEBinary
     public byte[] BuildImageBuffer()
     {
         uint imageSize = SizeOfImage;
-        if (imageSize == 0) throw new Exception("SizeOfImage is zero; cannot build image.");
+        if (imageSize == 0) throw new Exception("SizeOfImage is zero, cannot build image.");
 
         var mapped = new byte[imageSize];
 
@@ -265,11 +265,11 @@ public class PEBinary
             // We copy up to the lesser of raw size and virtual size.
             uint bytesToCopy = Math.Min(sec.SizeOfRawData, sec.VirtualSize);
 
-            // Guard: don't read past the file.
+            // Oppsie check: don't read past the file.
             if (srcOffset + bytesToCopy > Data.Length)
                 bytesToCopy = (uint)Math.Max(0, Data.Length - srcOffset);
 
-            // Guard: don't write past the image buffer either.
+            // Opsie check v2: don't write past the image buffer either.
             if (dstOffset + bytesToCopy > mapped.Length)
                 bytesToCopy = (uint)Math.Max(0, mapped.Length - dstOffset);
 
@@ -290,7 +290,7 @@ public class PEBinary
         return mapped;
     }
 
-    // Convert an RVA relative to the mapped image produced by BuildImageBuffer() into an index.
+    // Convert an RVA relative to the mapped image produced by BuildImageBuffer() into an index
     private int RvaToImageIndex(uint rva)
     {
         if (Image == null) throw new InvalidOperationException("Call BuildImageBuffer() first.");
@@ -300,7 +300,7 @@ public class PEBinary
 
     /// <summary>
     /// A tiny resolver cache used by the DefaultWin32Resolver so we don't call LoadLibrary repeatedly.
-    /// Not thread-safe intentionally — this is for tooling, not a high-concurrency server.
+    /// Not thread-safe intentionally since this is for tooling, not a high-concurrency server.
     /// </summary>
     private static Dictionary<string, IntPtr> _resolverModuleCache = new Dictionary<string, IntPtr>(StringComparer.OrdinalIgnoreCase);
 
@@ -352,24 +352,24 @@ public class PEBinary
     #region EXECUTION & LOADING
 
     /// <summary>
-    /// Simulated loader:
+    /// Crux of the logic:
     /// 1) Build a mapped image (managed).
     /// 2) Allocate RWX native memory.
     /// 3) Apply relocations for the chosen native base.
     /// 4) Resolve imports and write into the IAT(s).
     /// 5) Copy image to native memory and return its base address.
     /// 
-    /// This intentionally mirrors Windows loader steps roughly; don't expect perfect parity.
+    /// This intentionally mirrors Windows loader steps roughly, don't expect perfect parity, I am not a god
     /// </summary>
     public IntPtr LoadImage(ImportResolver resolver)
     {
         if (resolver == null) throw new ArgumentNullException(nameof(resolver));
 
-        // Step 1: build a mapped image buffer we can patch.
+        // build a mapped image buffer we can patch.
         BuildImageBuffer(); // side-effect: sets this.Image
         if (this.Image == null) throw new InvalidOperationException("BuildImageBuffer() failed.");
 
-        // Step 2: allocate native executable memory (RWX for simplicity).
+        // allocate native executable memory (RWX for simplicity).
         IntPtr nativeBase = Native.VirtualAlloc(
             IntPtr.Zero,
             (UIntPtr)this.Image.Length,
@@ -380,13 +380,13 @@ public class PEBinary
         if (nativeBase == IntPtr.Zero)
             throw new Exception("Failed to allocate executable memory.");
 
-        // Step 3: apply relocations to the in-memory image (Image[]), using the newly chosen base.
+        // apply relocations to the in-memory image (Image[]), using the newly chosen base.
         ApplyRelocations((ulong)nativeBase);
 
-        // Step 4: resolve imports (both regular and delay-load) and write addresses into IAT.
+        // resolve imports (both regular and delay-load) and write addresses into IAT.
         EmulateIATWrite(resolver);
 
-        // Step 5: copy patched image into native memory.
+        // copy patched image into native memory.
         Marshal.Copy(this.Image, 0, nativeBase, this.Image.Length);
 
         return nativeBase;
@@ -417,17 +417,17 @@ public class PEBinary
     /// - TLS callbacks are invoked.
     /// - For DLLs: DllMain(ATTACH) is called inline on current thread.
     /// - For EXEs: entry point is launched in a new thread (optionally waited upon).
-    /// Returns thread handle for EXE threads; IntPtr.Zero for DLLs or on failure.
+    /// Returns thread handle for EXE threads, IntPtr.Zero for DLLs or on failure.
     /// </summary>
     public IntPtr ExecuteLoadedImage(IntPtr nativeBase, bool waitForThread = false)
     {
         if (nativeBase == IntPtr.Zero)
             throw new ArgumentException("nativeBase cannot be zero.");
 
-        // 1. TLS callbacks
+        // TLS callbacks
         ExecuteTLSCallbacks(nativeBase);
 
-        // 2. Entry point RVA
+        // Entry point RVA
         uint entryRva = AddressOfEntryPoint;
         if (entryRva == 0)
             return IntPtr.Zero;
@@ -514,7 +514,7 @@ public class PEBinary
             var importDesc = new ImportDescriptor();
             importDesc.DLLName = ReadAsciiStringAtRva(desc.Name) ?? string.Empty;
 
-            // Some files omit OriginalFirstThunk; use FirstThunk as fallback.
+            // Some files omit OriginalFirstThunk, so use FirstThunk as fallback.
             uint sourceThunkRva = desc.OriginalFirstThunk != 0 ? desc.OriginalFirstThunk : desc.FirstThunk;
             int thunkOffset = RvaToOffset(sourceThunkRva);
 
@@ -593,7 +593,7 @@ public class PEBinary
         }
     }
 
-    // Helper: read an ASCII string given a direct file offset (not RVA).
+    // read an ASCII string given a direct file offset (not RVA).
     private string ReadAsciiStringAtOffset(int off)
     {
         if (off < 0 || off >= Data.Length) return null;
@@ -610,7 +610,9 @@ public class PEBinary
     #endregion
 
     #region D-LOAD IMPORTS
-    
+
+    // this is similar to regular imports but has its own table format
+    // Aaaalso, these technically are regular imports but loaded on-demand by the loader.
     private void ParseDelayImports(uint rva, uint size)
     {
         DelayImports.Clear();
@@ -716,6 +718,7 @@ public class PEBinary
 
     #region Exports
 
+    // self-explanatory
     private void ParseExportTable(uint exportTableRva, uint exportTableSize)
     {
         Exports.Clear();
@@ -754,6 +757,10 @@ public class PEBinary
 
     #region Base Reloc
 
+    // this is a bit more involved
+    // we are essentially reading blocks of relocations
+    // each block has a header and then a list of type/offset entries
+    // we store them in BaseRelocations list for later processing
     private void ParseBaseRelocations(uint baseRelocRva, uint baseRelocSize)
     {
         BaseRelocations.Clear();
@@ -914,6 +921,9 @@ public class PEBinary
 
     #region TLS
 
+    // ahem, this one too is a bit involved
+    // we need to read the TLS directory and then read the callback list
+    // The callback list is null-terminated and contains either RVAs or VAs.
     private void ParseTLS(uint rva, uint size)
     {
         int off = RvaToOffset(rva);
@@ -1012,6 +1022,10 @@ public class PEBinary
 
     #region Resources
 
+    // resources are stored in a tree-like structure
+    // we need to recursively parse directories and entries
+    // each directory has named/id entries and points to either subdirectories or data entries
+    // data entries point to the actual resource data
     private void ParseResources(uint rva, uint size)
     {
         int baseOff = RvaToOffset(rva);
