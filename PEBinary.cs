@@ -27,7 +27,7 @@ public class PEBinary
     public TLSDirectory TLS { get; private set; } = null;
     public ResourceDirectory Resources { get; private set; } = null;
 
-    // Built, mapped image (headers + sections, after we 'map' it in memory)
+    // Built, mapped image (headers + sections, after we map it in memory)
     public byte[] Image { get; private set; } = null;
 
     // Convenience summary properties
@@ -52,8 +52,7 @@ public class PEBinary
         }
         catch
         {
-            // File.ReadAllBytes throws an exception for extremely large files on some runtimes;
-            // user-friendly rewrap so callers get a clearer message.
+            // File.ReadAllBytes throws an exception for extremely large files on some runtimes
             throw new Exception("The file exceeds the maximum size allowed by File.ReadAllBytes(). Please choose a smaller file.");
         }
 
@@ -62,23 +61,23 @@ public class PEBinary
 
     private void TryParse()
     {
-        // ----- DOS header -----
+        // DOS header 
         DosHeader = Helpers.FromBytes<IMAGE_DOS_HEADER>(Data, 0);
         if (DosHeader.e_magic != 0x5A4D) // 'MZ'
             throw new Exception("Not a valid PE file (missing MZ header).");
 
-        // ----- NT header signature -----
+        // NT header signature 
         int ntHdrOffset = DosHeader.e_lfanew;
         if (ntHdrOffset <= 0 || ntHdrOffset + 4 > Data.Length) throw new Exception("Invalid e_lfanew.");
         uint ntSignature = BitConverter.ToUInt32(Data, ntHdrOffset);
         if (ntSignature != 0x00004550) // 'PE\0\0'
             throw new Exception("Invalid NT Header signature.");
 
-        // ----- File header -----
+        // File header 
         int fileHdrOffset = ntHdrOffset + 4;
         FileHeader = Helpers.FromBytes<IMAGE_FILE_HEADER>(Data, fileHdrOffset);
 
-        // ----- Optional header -----
+        // Optional header 
         int optHdrOffset = fileHdrOffset + Marshal.SizeOf(typeof(IMAGE_FILE_HEADER));
         ushort optMagic = BitConverter.ToUInt16(Data, optHdrOffset);
         if (optMagic == 0x10b)
@@ -94,13 +93,13 @@ public class PEBinary
             throw new Exception("Unknown Optional Header Magic.");
         }
 
-        // ----- Section headers -----
+        // Section headers 
         int optionalHdrSize = FileHeader.SizeOfOptionalHeader;
         int secTableOffset = optHdrOffset + optionalHdrSize;
         int secEntrySize = Marshal.SizeOf(typeof(IMAGE_SECTION_HEADER));
         SectionHeaders.Clear();
 
-        // Human note: do not assume the file is perfectly formed; be defensive.
+        // do not assume the file is perfectly formed, jesus have I seen some things over the years.
         for (int i = 0; i < FileHeader.NumberOfSections; i++)
         {
             int entryOffset = secTableOffset + i * secEntrySize;
@@ -169,22 +168,21 @@ public class PEBinary
 
     #endregion
 
-
     #region RVA helpers
 
     /// <summary>
     /// Convert RVA -> file offset in Data[].
-    /// Returns -1 for invalid/unmapped RVA (e.g., .bss).
-    /// This function errs on the side of safety rather than optimism.
+    /// Returns -1 for invalid/unmapped RVA (like .bss).
+    /// This function errs on the side of safety rather than optimism, hehe
     /// </summary>
     public int RvaToOffset(uint rva)
     {
         uint hdrSize = GetSizeOfHeaders();
 
-        // If the RVA is within headers, it's a direct mapping (if file contains that many bytes).
+        // If the RVA is within headers, it's a direct mapping (if file contains that many bytes)
         if (rva < hdrSize)
         {
-            // Defensive: ensure we don't return an offset beyond the file.
+            // ensure we don't return an offset beyond the file
             if (rva >= Data.Length) return -1;
             return (int)rva;
         }
@@ -209,7 +207,7 @@ public class PEBinary
 
                 int fileOff = (int)(s.PointerToRawData + offsetInSection);
 
-                // Sanity check: ensure we don't point past the file end.
+                // Sanity check
                 if (fileOff < 0 || fileOff + (secRawSize - offsetInSection) > Data.Length)
                 {
                     return -1;
@@ -219,22 +217,8 @@ public class PEBinary
             }
         }
 
-        // Not found in any section; invalid RVA.
+        // Not found in any section, invalid RVA.
         return -1;
-    }
-
-    // Return the section header that would contain this RVA (or null).
-    private IMAGE_SECTION_HEADER? GetSectionForRva(uint rva)
-    {
-        foreach (var sec in SectionHeaders)
-        {
-            uint va = sec.VirtualAddress;
-            // Use max of VirtualSize and SizeOfRawData to be tolerant of odd files.
-            uint span = Math.Max(sec.VirtualSize, sec.SizeOfRawData);
-            if (rva >= va && rva < va + span)
-                return sec;
-        }
-        return null;
     }
 
     // Read a null-terminated ASCII string from file using an RVA.
@@ -364,7 +348,6 @@ public class PEBinary
     }
 
     #endregion
-
 
     #region EXECUTION & LOADING
 
