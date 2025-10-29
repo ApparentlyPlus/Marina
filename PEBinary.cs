@@ -341,6 +341,149 @@ public class PEBinary
         _resolverModuleCache.Clear();
     }
 
+    // ---------------------------
+    // EXECUTION & LOADING
+    // ---------------------------
+
+    /// <summary>
+    /// Simulates the Windows Loader:
+    /// 1. Allocates executable memory.
+    /// 2. Builds the image buffer (headers + sections).
+    /// 3. Applies base relocations to the new address.
+    /// 4. Resolves and writes the IAT.
+    /// 5. Copies the final image into executable memory.
+    /// Returns the native base address of the loaded image.
+    /// </summary>
+    public IntPtr LoadImage(ImportResolver resolver)
+    {
+        if (resolver == null) throw new ArgumentNullException(nameof(resolver));
+
+        // 1. Build the image in a managed byte[] first
+        BuildImageBuffer(); // Populates this.Image
+        if (this.Image == null) throw new InvalidOperationException("BuildImageBuffer() failed.");
+
+        // 2. Allocate native executable memory
+        IntPtr nativeBase = Native.VirtualAlloc(
+            IntPtr.Zero, // OS chooses address
+            (UIntPtr)this.Image.Length,
+            Native.MEM_COMMIT | Native.MEM_RESERVE,
+            Native.PAGE_EXECUTE_READ_WRITE
+        );
+        if (nativeBase == IntPtr.Zero)
+            throw new Exception("Failed to allocate executable memory.");
+
+        // 3. Apply relocations based on the new native address
+        ApplyRelocations((ulong)nativeBase);
+
+        // 4. Resolve imports and write them into the IAT
+        EmulateIATWrite(resolver);
+
+        // 5. Copy the final, patched image into the executable memory
+        Marshal.Copy(this.Image, 0, nativeBase, this.Image.Length);
+
+        return nativeBase;
+    }
+
+    /// <summary>
+    /// Executes the TLS callbacks (if any) for a loaded image.
+    /// This MUST be called before the entry point.
+    /// </summary>
+    private void ExecuteTLSCallbacks(IntPtr nativeBase)
+    {
+        if (TLS == null || TLS.CallbackRVAs.Count == 0)
+            return;
+
+        foreach (uint rva in TLS.CallbackRVAs)
+        {
+            if (rva == 0) continue;
+            IntPtr pCallback = IntPtr.Add(nativeBase, (int)rva);
+            var callback = Marshal.GetDelegateForFunctionPointer<Native.DllMain>(pCallback);
+
+            // Call the callback with DLL_PROCESS_ATTACH
+            callback(nativeBase, Native.DLL_PROCESS_ATTACH, IntPtr.Zero);
+        }
+    }
+
+    /// <summary>
+    // Executes a loaded image at its native base address.
+    // - Calls TLS Callbacks.
+    // - If a DLL, calls DllMain(ATTACH) in the current thread.
+    // - If an EXE, calls the EntryPoint in a new thread.
+    /// </summary>
+    /// <param name="nativeBase">The pointer returned by LoadImage().</param>
+    /// <param name="waitForThread">If true, blocks until the new EXE thread exits.</param>
+    /// <returns>The thread handle if an EXE is launched, otherwise IntPtr.Zero.</returns>
+    public IntPtr ExecuteLoadedImage(IntPtr nativeBase, bool waitForThread = false)
+    {
+        if (nativeBase == IntPtr.Zero)
+            throw new ArgumentException("nativeBase cannot be zero.");
+
+        // 1. Execute TLS Callbacks
+        ExecuteTLSCallbacks(nativeBase);
+
+        // 2. Get the final entry point address
+        uint aoe = AddressOfEntryPoint;
+        if (aoe == 0)
+            return IntPtr.Zero; // No entry point
+
+        IntPtr pEntryPoint = IntPtr.Add(nativeBase, (int)aoe);
+
+        if (IsDll)
+        {
+            // --- This is a DLL ---
+            // Call DllMain(ATTACH) directly in this thread
+            // This mimics LoadLibrary's behavior
+            var dllMain = Marshal.GetDelegateForFunctionPointer<Native.DllMain>(pEntryPoint);
+            dllMain(nativeBase, Native.DLL_PROCESS_ATTACH, IntPtr.Zero);
+            return IntPtr.Zero; // No thread handle
+        }
+        else
+        {
+            // --- This is an EXE ---
+            // Launch the entry point in a new thread
+            IntPtr hThread = Native.CreateThread(
+                IntPtr.Zero, 0,
+                pEntryPoint,
+                IntPtr.Zero, // No parameter
+                0, // Run immediately
+                out uint _
+            );
+
+            if (waitForThread && hThread != IntPtr.Zero)
+            {
+                Native.WaitForSingleObject(hThread, Native.INFINITE);
+                Native.CloseHandle(hThread);
+                return IntPtr.Zero;
+            }
+
+            return hThread; // Return the new thread's handle
+        }
+    }
+
+    /// <summary>
+    /// Cleans up a loaded image:
+    /// 1. Calls DllMain(DETACH) if it's a DLL.
+    /// 2. Frees the executable memory via VirtualFree.
+    /// </summary>
+    public void UnloadImage(IntPtr nativeBase)
+    {
+        if (nativeBase == IntPtr.Zero) return;
+
+        // If it's a DLL, we must call DllMain(DETACH)
+        if (IsDll && AddressOfEntryPoint != 0)
+        {
+            try
+            {
+                IntPtr pEntryPoint = IntPtr.Add(nativeBase, (int)AddressOfEntryPoint);
+                var dllMain = Marshal.GetDelegateForFunctionPointer<Native.DllMain>(pEntryPoint);
+                dllMain(nativeBase, Native.DLL_PROCESS_DETACH, IntPtr.Zero);
+            }
+            catch { /* Best-effort cleanup */ }
+        }
+
+        // Free the memory
+        Native.VirtualFree(nativeBase, UIntPtr.Zero, Native.MEM_RELEASE);
+    }
 
     // ---------------------------
     // IMPORTS
