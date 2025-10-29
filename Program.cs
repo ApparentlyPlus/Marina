@@ -1,4 +1,4 @@
-﻿
+﻿using System;
 using System.IO;
 
 namespace Marina
@@ -7,27 +7,49 @@ namespace Marina
     {
         static void Main(string[] args)
         {
-            Helpers.PrintBanner();
-            Console.Write("Enter path to PE file (DLL or EXE): ");
-            PEBinary pe = new PEBinary(Console.ReadLine());
+            string pePath;
+
+            // Check if a file path was passed as a command-line argument
+            if (args.Length > 0)
+            {
+                // Non-interactive (CI) mode
+                pePath = args[0];
+            }
+            else
+            {
+                // Interactive mode
+                Helpers.PrintBanner();
+                Console.Write("Enter path to PE file (DLL or EXE): ");
+                pePath = Console.ReadLine();
+            }
+
+            // Basic validation
+            if (string.IsNullOrEmpty(pePath) || !File.Exists(pePath))
+            {
+                Console.WriteLine($"[!] ERROR: File not found or path is empty: '{pePath}'");
+                return;
+            }
+
+            PEBinary pe = null;
+            IntPtr nativeBase = IntPtr.Zero; // Defined here for use in finally block
 
             try
             {
+                pe = new PEBinary(pePath);
                 Console.WriteLine($"[+] Parsed. Arch: {(pe.Is64Bit ? "x64" : "x86")}, Type: {(pe.IsDll ? "DLL" : "EXE")}");
 
-                // Load the image into executable memory
-                // This runs BuildImageBuffer, VirtualAlloc, ApplyRelocations, and EmulateIATWrite
-                var nativeBase = pe.LoadImage(PEBinary.DefaultWin32Resolver);
+                nativeBase = pe.LoadImage(PEBinary.DefaultWin32Resolver);
                 Console.WriteLine($"[+] Image loaded at: 0x{nativeBase.ToInt64():X}");
 
-                //"Jump" to the entry point
-                // This runs TLS callbacks and then calls the entry point
+                // This logic from your original file will now work for BOTH
+                // interactive use and the CI build, as it waits for EXEs
+                // to finish.
                 IntPtr hThread = pe.ExecuteLoadedImage(nativeBase, false); // false = don't wait
 
                 if (hThread != IntPtr.Zero)
                 {
                     Console.WriteLine($"[+] EXE launched in new thread. Handle: 0x{hThread.ToInt64():X}");
-                    // You could wait for it here if you want
+                    // This wait is crucial for the CI build to capture output
                     Native.WaitForSingleObject(hThread, Native.INFINITE);
                     Console.WriteLine("[+] Thread exited.");
                     Native.CloseHandle(hThread);
@@ -36,9 +58,6 @@ namespace Marina
                 {
                     Console.WriteLine("[+] DLLMain(ATTACH) called. Load complete.");
                 }
-
-                // Note: If you load a DLL, it's now loaded in your process.
-                // If you load an EXE, it's running in a new thread inside your process.
             }
             catch (Exception ex)
             {
@@ -46,18 +65,13 @@ namespace Marina
             }
             finally
             {
-                // Clean up
-                // If you loaded an EXE, you might want to leave it running.
-                // If you loaded a DLL, you'd unload it like this:
-
-                // if (pe != null && nativeBase != IntPtr.Zero && pe.IsDll)
-                // {
-                //    Console.WriteLine("[+] Unloading DLL...");
-                //    pe.UnloadImage(nativeBase);
-                //    PEBinary.ClearResolverCache();
-                // }
+                if (pe != null && nativeBase != IntPtr.Zero && pe.IsDll)
+                {
+                    Console.WriteLine("[+] Unloading DLL...");
+                    pe.UnloadImage(nativeBase);
+                    PEBinary.ClearResolverCache();
+                }
             }
-
         }
     }
 }
