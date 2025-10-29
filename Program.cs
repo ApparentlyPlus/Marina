@@ -7,7 +7,7 @@ namespace Marina
     {
         static void Main(string[] args)
         {
-            Console.WriteLine("Marina: An In Memory PE Loader Demo");
+            Helpers.PrintBanner();
             Console.Write("Enter path to PE file (DLL or EXE): ");
             PEBinary pe = new PEBinary(Console.ReadLine());
 
