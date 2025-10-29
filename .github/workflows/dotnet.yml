@@ -23,15 +23,21 @@ jobs:
 
     - name: Add MSVC (C/C++ compiler) to PATH
       # This action sets up cl.exe and link.exe
-      uses: microsoft/setup-msvc@v1
+      # Replaced microsoft/setup-msvc with the correct community-standard action
+      uses: ilammy/msvc-dev-cmd@v1
 
     - name: Restore .NET dependencies
-      run: dotnet restore
+      # We must override the 'Platform=x64' env var set by the MSVC action
+      # FIX: Removed the incorrect '.\Marina\' prefix
+      run: dotnet restore Marina.sln /p:Platform="Any CPU"
     
-    - name: Build C# Loader (x64)
-      # We build for a specific runtime (win-x64) to match our C++ build
-      # Assumes your project is named Marina.csproj
-      run: dotnet build Marina.csproj --no-restore --configuration Release --runtime win-x64
+    - name: Build C# Loader (Any CPU)
+      # We build for "Any CPU" as this is the standard platform in most .sln files.
+      # On an x64 runner, this will execute as an x64 process.
+      # 1. Force OutputType to Exe
+      # 2. Specify a clean output directory
+      # FIX: Removed the incorrect '.\Marina\' prefix
+      run: dotnet build Marina.csproj --no-restore --configuration Release /p:Platform="Any CPU" /p:OutputType=Exe --output .\build_output
 
     - name: Build C Test App (x64)
       # We compile our new CI-friendly C file
@@ -54,10 +60,9 @@ jobs:
       shell: powershell
       
     - name: Run Integration Test
-      # We run the C# loader and pass the C .exe as an argument
-      # The new Program.cs will accept minimal_ci.exe as args[0]
+      # 3. Use the correct path from our build output
       run: |
-        .\bin\Release\net8.0\win-x64\Marina.exe minimal_ci.exe > output.txt 2>&1
+        .\build_output\Marina.exe minimal_ci.exe > output.txt 2>&1
       shell: powershell
 
     - name: Validate Test Output
