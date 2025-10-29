@@ -34,6 +34,11 @@ public class PEBinary
     public uint SizeOfImage => OptionalHeader64?.SizeOfImage ?? OptionalHeader32?.SizeOfImage ?? 0U;
     public uint AddressOfEntryPoint => OptionalHeader64?.AddressOfEntryPoint ?? OptionalHeader32?.AddressOfEntryPoint ?? 0U;
 
+    private const ushort IMAGE_FILE_DLL = 0x2000;
+    public bool IsDll => (FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
+
+
+
     public PEBinary(string filePath)
     {
         if (!File.Exists(filePath))
@@ -158,19 +163,53 @@ public class PEBinary
     // ---------------------------
     // RVA helpers
     // ---------------------------
+
+    /// <summary>
+    /// Converts a Relative Virtual Address (RVA) to a file offset in the Data[].
+    /// Returns -1 if the RVA is invalid, points outside the file, or points
+    /// to uninitialized data (which has no file offset).
+    /// </summary>
     public int RvaToOffset(uint rva)
     {
         uint soHeaders = GetSizeOfHeaders();
-        if (rva < soHeaders) return (int)rva;
+        if (rva < soHeaders)
+        {
+            // RVA is in the headers.
+            // Check if it's within the bounds of the loaded file data.
+            if (rva >= Data.Length) return -1;
+            return (int)rva;
+        }
 
         foreach (var s in SectionHeaders)
         {
             uint va = s.VirtualAddress;
-            uint vsz = Math.Max(s.VirtualSize, s.SizeOfRawData);
+            uint vsz = s.VirtualSize; // The size in memory
+            uint rsz = s.SizeOfRawData; // The size on disk
+
+            // Check if the RVA is within this section's memory range
             if (rva >= va && rva < va + vsz)
             {
                 uint delta = rva - va;
-                return (int)(s.PointerToRawData + delta);
+
+                // If the offset within the section is greater than its raw size,
+                // it points to uninitialized data (e.g., .bss). This has no
+                // file offset.
+                if (delta >= rsz)
+                {
+                    return -1;
+                }
+
+                int fileOffset = (int)(s.PointerToRawData + delta);
+
+                // Final sanity check: does the calculated offset point within the file?
+                // (rsz check should be sufficient, but this protects against
+                // sections that point to raw data > file length)
+                if (fileOffset < 0 || fileOffset + (rsz - delta) > Data.Length)
+                {
+                    return -1;
+                }
+
+                return fileOffset;
             }
         }
         return -1;
